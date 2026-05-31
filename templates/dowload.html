@@ -515,6 +515,24 @@
             align-items: center;
         }
 
+        .batch-mode {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 46px;
+            padding: 0 14px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.07);
+            color: rgba(255, 255, 255, 0.86);
+            font-weight: 800;
+            cursor: pointer;
+        }
+
+        .batch-mode input {
+            accent-color: #ff2b2b;
+        }
+
         .batch-results {
             display: none;
             max-height: 180px;
@@ -1030,6 +1048,10 @@ https://example.com/video..."
                 <button class="btn btn-secondary" type="button" id="importBatchFileBtn">Importer un .txt</button>
                 <input id="batchFileInput" type="file" accept=".txt,.list,.csv" hidden>
                 <button class="btn btn-primary" type="button" id="startBatchBtn">Telecharger la liste</button>
+                <label class="batch-mode" title="Active ce mode pour generer seulement la saison de la premiere URL collee.">
+                    <input id="currentSeasonOnly" type="checkbox">
+                    Saison de la premiere URL
+                </label>
                 <button class="btn btn-secondary" type="button" id="fetchEpisodesBtn" style="background: rgba(201, 96, 52, 0.2); border-color: var(--accent);">Trouver episodes</button>
                 <button class="btn btn-secondary" type="button" id="clearBatchBtn">Vider</button>
             </div>
@@ -1076,6 +1098,7 @@ https://example.com/video..."
         const batchFileInput = document.getElementById("batchFileInput");
         const startBatchBtn = document.getElementById("startBatchBtn");
         const clearBatchBtn = document.getElementById("clearBatchBtn");
+        const currentSeasonOnly = document.getElementById("currentSeasonOnly");
         const fetchEpisodesBtn = document.getElementById("fetchEpisodesBtn");
         const batchResults = document.getElementById("batchResults");
         const typeButtons = document.querySelectorAll("[data-type]");
@@ -1215,7 +1238,8 @@ https://example.com/video..."
                     
                     if (data.skipped) {
                         skippedCount += 1;
-                        addBatchResult(`SAUTE: ${url} (${data.message || "Lecteur non capture ou indisponible"})`, "fail");
+                        const skipState = data.reason === "already_exists" ? "ok" : "fail";
+                        addBatchResult(`SAUTE: ${url} (${data.message || "Lecteur non capture ou indisponible"})`, skipState);
                         continue;
                     }
 
@@ -1670,9 +1694,10 @@ https://example.com/video..."
             batchResults.innerHTML = "";
             batchResults.classList.remove("visible");
         });
-        fetchEpisodesBtn.addEventListener("click", async () => {
+        async function fetchEpisodesList() {
             const lines = normalizeBatchText(batchUrls.value).trim().split("\n");
             const firstUrl = lines[0] ? lines[0].trim() : "";
+            const currentOnly = Boolean(currentSeasonOnly && currentSeasonOnly.checked);
 
             if (!firstUrl || !firstUrl.includes("franime.fr")) {
                 addBatchResult("Veuillez coller une URL Franime valide en premiere ligne.", "fail");
@@ -1680,13 +1705,16 @@ https://example.com/video..."
             }
 
             fetchEpisodesBtn.disabled = true;
-            addBatchResult("Recherche des episodes en cours...", "");
+            if (currentSeasonOnly) {
+                currentSeasonOnly.disabled = true;
+            }
+            addBatchResult(currentOnly ? "Recherche de la saison de la premiere URL..." : "Recherche de tous les episodes...", "");
 
             try {
                 const response = await fetch("/fetch-episodes", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ url: firstUrl })
+                    body: JSON.stringify({ url: firstUrl, current_only: currentOnly })
                 });
 
                 const data = await response.json();
@@ -1701,8 +1729,13 @@ https://example.com/video..."
                 addBatchResult(`Erreur reseau: ${error.message}`, "fail");
             } finally {
                 fetchEpisodesBtn.disabled = false;
+                if (currentSeasonOnly) {
+                    currentSeasonOnly.disabled = false;
+                }
             }
-        });
+        }
+
+        fetchEpisodesBtn.addEventListener("click", fetchEpisodesList);
         startBatchBtn.addEventListener("click", runBatchDownload);
         batchModal.addEventListener("click", (event) => {
             if (event.target === batchModal) {

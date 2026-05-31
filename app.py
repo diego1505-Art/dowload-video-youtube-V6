@@ -157,6 +157,10 @@ def fetch_episodes():
         query = parse_qs(parsed.query)
         anime_id = query.get("anime_id", [None])[0]
         lang = query.get("lang", ["vo"])[0]
+        try:
+            requested_season = max(1, int(query.get("s", ["1"])[0] or "1"))
+        except ValueError:
+            requested_season = 1
         
         # On extrait le "slug" de l'anime (le nom dans l'URL)
         path_parts = parsed.path.split('/')
@@ -166,33 +170,37 @@ def fetch_episodes():
         # --- MÉTHODE 1 : MyAnimeList ---
         try:
             search_name = anime_slug.replace('-', ' ')
-            # On cherche de manière plus large
+            # On cherche sur MAL pour avoir la structure globale
             search_res = requests.get(f"https://api.jikan.moe/v4/anime?q={search_name}&type=tv&order_by=start_date&sort=asc", timeout=5)
+
             if search_res.ok:
                 results = search_res.json().get('data', [])
-                
-                # On garde TOUS les résultats TV qui contiennent au moins un mot clé du nom
-                # pour être sûr de ne rien rater
                 keywords = [k for k in anime_slug.split('-') if len(k) > 3]
-                main_results = []
-                for r in results:
-                    title_lower = r['title'].lower()
-                    if any(k in title_lower for k in keywords):
-                        main_results.append(r)
+                main_results = [r for r in results if any(k in r['title'].lower() for k in keywords)]
                 
                 if not main_results:
-                    main_results = results[:3] # Fallback si le filtre échoue
+                    main_results = results[:3]
 
                 all_urls = []
                 summary_info = []
-                
-                for i, anime_entry in enumerate(main_results):
-                    # On détecte le numéro de saison dans le titre ou on utilise l'index
-                    season_num = i + 1
+
+                # Si l'utilisateur colle une URL avec s=2, il veut cette saison précise.
+                # Pour s=1, on garde le comportement "tout trouver" historique.
+                seasons_to_generate = list(enumerate(main_results, start=1))
+                if requested_season > 1 or data.get("current_only"):
+                    seasons_to_generate = [
+                        item for item in seasons_to_generate if item[0] == requested_season
+                    ] or [(requested_season, main_results[min(requested_season - 1, len(main_results) - 1)])]
+
+                for season_num, anime_entry in seasons_to_generate:
                     ep_count = anime_entry.get('episodes') or 24
-                    
+
+                    # Franime peut garder le même anime_id pour plusieurs saisons.
+                    # La séparation fiable est donc le paramètre s=, pas l'ID.
+                    season_best_id = anime_id
+                    print(f"[DEBUG] Saison {season_num} -> anime_id conserve : {season_best_id}")
                     for ep_num in range(1, ep_count + 1):
-                        all_urls.append(f"{base_page_url}?s={season_num}&ep={ep_num}&lang={lang}&anime_id={anime_id}")
+                        all_urls.append(f"{base_page_url}?s={season_num}&ep={ep_num}&lang={lang}&anime_id={season_best_id}")
                     
                     summary_info.append(f"S{season_num} ({ep_count} eps)")
 
@@ -220,7 +228,14 @@ def fetch_episodes():
                     props = next_data.get("props", {}).get("pageProps", {})
                     anime_data = props.get("anime") or props.get("data")
                     if anime_data and "saisons" in anime_data:
-                        return generate_episode_urls(anime_data["saisons"], base_page_url, lang, anime_id, anime_data.get("title", "Anime"))
+                        return generate_episode_urls(
+                            anime_data["saisons"],
+                            base_page_url,
+                            lang,
+                            anime_id,
+                            anime_data.get("title", "Anime"),
+                            requested_season=requested_season if requested_season > 1 or data.get("current_only") else None,
+                        )
         except Exception:
             pass
 
@@ -232,11 +247,13 @@ def fetch_episodes():
     except Exception as e:
         return jsonify({"success": False, "error": f"Erreur système: {str(e)}"}), 500
 
-def generate_episode_urls(seasons, base_url, lang, anime_id, title):
+def generate_episode_urls(seasons, base_url, lang, anime_id, title, requested_season=None):
     all_urls = []
     for s_idx, season in enumerate(seasons):
         episodes = season.get("episodes", [])
         s_num = s_idx + 1
+        if requested_season is not None and s_num != requested_season:
+            continue
         for ep_idx, _ in enumerate(episodes):
             ep_num = ep_idx + 1
             ep_url = f"{base_url}?s={s_num}&ep={ep_num}&lang={lang}&anime_id={anime_id}"
@@ -289,15 +306,25 @@ def download():
 
         filename = result.get("filename")
         relative_path = result.get("relative_path") or filename
+        
+        if result.get("skipped"):
+            reason = result.get("reason")
+            if reason == "already_exists":
+                reason_msg = "Déjà téléchargé."
+            elif reason == "page_blocked":
+                reason_msg = "Page bloquée par le serveur distant."
+            else:
+                reason_msg = "Introuvable ou indisponible."
+            return jsonify({
+                "success": True,
+                "skipped": True,
+                "reason": reason,
+                "message": f"Episode sauté : {reason_msg}",
+                "filename": filename,
+                "source_label": source_value
+            })
+
         if not filename:
-            # Si l'extracteur Franime nous dit qu'il n'a rien trouvé, on saute proprement
-            if result.get("reason") == "not_found_or_blocked":
-                return jsonify({
-                    "success": True,
-                    "skipped": True,
-                    "message": "Episode saute : lecteur non capture, bloque ou indisponible.",
-                    "source_label": source_value
-                })
             return jsonify({"success": False, "error": result.get("error", "Fichier telecharge mais introuvable.")}), 500
 
         from urllib.parse import urlparse

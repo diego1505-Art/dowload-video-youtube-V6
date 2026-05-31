@@ -1,11 +1,13 @@
 """
 Extracteur franime.fr — supporte SIBNET, FILEMOON, SENDVID, VIDMOLY et HLS direct.
-Lance Chrome visible, intercepte les URLs des lecteurs, essaie chaque lecteur dans l'ordre.
+Lance Chrome en arrière-plan par défaut, intercepte les URLs des lecteurs, essaie chaque lecteur dans l'ordre.
 """
 from __future__ import annotations
 import re, os, shutil, tempfile
 from pathlib import Path
 from typing import Any
+
+from config import BROWSER_HEADLESS
 
 FRANIME_PATTERN = re.compile(r"https?://(?:www\.)?franime\.fr/", re.IGNORECASE)
 
@@ -28,7 +30,7 @@ SKIP_HOSTS = {
 }
 
 # Priorité de téléchargement (yt-dlp supporte tous ces domaines)
-LECTEUR_PRIORITY = ["SIBNET", "FILEMOON", "SENDVID", "VIDMOLY", "HLS", "WATCH2"]
+LECTEUR_PRIORITY = ["HLS", "SIBNET", "SENDVID", "VIDMOLY", "FILEMOON", "WATCH2"]
 
 
 def is_franime_url(url: str) -> bool:
@@ -103,10 +105,9 @@ def _resolve_downloaded_file(info: dict[str, Any], output_path: str, before_mtim
     return candidates[0][1] if candidates else None
 
 
-def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> tuple[str | None, str | None]:
+def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> tuple[str | None, str | None, dict[str, list[str]], dict[str, Any]]:
     """
-    Retourne (url_stream, nom_lecteur) ou (None, None).
-    preferred_lecteur : forcer un lecteur spécifique (ex: "FILEMOON")
+    Retourne (url_stream, nom_lecteur, all_captured, diagnostics).
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
@@ -115,6 +116,11 @@ def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> t
 
     # dict lecteur → liste d'URLs trouvées
     captured: dict[str, list[str]] = {name: [] for name, *_ in LECTEURS}
+    diagnostics: dict[str, Any] = {
+        "main_status": None,
+        "blocked": False,
+        "blocked_url": None,
+    }
 
     def on_request(req):
         url = req.url
@@ -127,6 +133,12 @@ def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> t
     def on_response(resp):
         url = resp.url
         if _skip(url): return
+        # On ne bloque plus sur le 403 immédiatement, Cloudflare renvoie souvent 403/503 pendant le challenge
+        if url.split("#", 1)[0] == page_url.split("#", 1)[0]:
+            diagnostics["main_status"] = resp.status
+            if resp.status in {401, 429}: # On garde 401 et 429 comme bloquants réels
+                diagnostics["blocked"] = True
+                diagnostics["blocked_url"] = url
         ct = resp.headers.get("content-type", "").lower()
         if any(t in ct for t in ["mpegurl", "dash+xml", "mp2t", "x-mpegurl"]):
             name = _detect_lecteur(url) or "HLS"
@@ -143,10 +155,20 @@ def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> t
     print(f"  [franime] Chrome : {chrome_path or 'Chromium Playwright'}")
 
     with sync_playwright() as pw:
-        base_args = ["--no-sandbox", "--disable-blink-features=AutomationControlled", "--disable-infobars"]
+        # Arguments pour plus de discrétion (anti-bot)
+        base_args = [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--disable-dev-shm-usage",
+            "--disable-gpu"
+        ]
+
+        # User-Agent réaliste
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
         if chrome_path and user_data_dir and os.path.isdir(os.path.join(user_data_dir, "Default")):
-            # Copie légère : cookies + session uniquement (pas le cache)
+            # ... (reste de la logique de copie inchangé)
             tmp_profile = tempfile.mkdtemp(prefix="dowflow_")
             dst_default = os.path.join(tmp_profile, "Default")
             os.makedirs(dst_default, exist_ok=True)
@@ -160,14 +182,23 @@ def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> t
             if os.path.isfile(ls):
                 try: shutil.copy2(ls, os.path.join(tmp_profile, "Local State"))
                 except Exception: pass
+            
             ctx = pw.chromium.launch_persistent_context(
-                tmp_profile, headless=False, executable_path=chrome_path,
-                args=base_args, no_viewport=True)
+                tmp_profile, headless=BROWSER_HEADLESS, executable_path=chrome_path,
+                args=base_args, no_viewport=True, user_agent=user_agent,
+                locale="fr-FR")
             page = ctx.new_page()
         else:
-            browser = pw.chromium.launch(headless=False, executable_path=chrome_path or None, args=base_args)
-            ctx = browser.new_context(viewport={"width": 1280, "height": 720}, locale="fr-FR")
+            browser = pw.chromium.launch(headless=BROWSER_HEADLESS, executable_path=chrome_path or None, args=base_args)
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 720}, 
+                locale="fr-FR",
+                user_agent=user_agent
+            )
             page = ctx.new_page()
+
+        # Injection de script pour masquer Playwright
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         page.on("request",  on_request)
         page.on("response", on_response)
@@ -176,6 +207,33 @@ def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> t
             page.goto(page_url, wait_until="domcontentloaded", timeout=45_000)
         except PwTimeout:
             print("  [franime] Timeout – on continue")
+
+        # Détection Cloudflare
+        if "challenge-platform" in page.content() or "cloudflare" in page.content().lower() or "just a moment" in page.title().lower():
+            print("  [franime] Challenge Cloudflare détecté, attente de résolution (jusqu'à 25s)...")
+            try:
+                # On essaie de cliquer sur la checkbox si elle apparaît (iframe Cloudflare)
+                for _ in range(5):
+                    if "challenge-platform" not in page.content() and "cloudflare" not in page.content().lower():
+                        break
+                    # On cherche l'iframe du challenge
+                    frames = page.frames
+                    for f in frames:
+                        if "cloudflare" in f.url or "turnstile" in f.url:
+                            try:
+                                checkbox = f.query_selector("input[type='checkbox']")
+                                if checkbox:
+                                    checkbox.click()
+                                    print("  [franime] ✓ Clic sur la checkbox Cloudflare")
+                            except: pass
+                    page.wait_for_timeout(2000)
+
+                # On attend le bouton final
+                page.wait_for_selector("button:has-text('Regarder')", timeout=20_000)
+                print("  [franime] ✓ Challenge Cloudflare passé !")
+            except Exception:
+                print("  [franime] ⚠ Le challenge semble toujours présent ou le bouton n'apparaît pas.")
+                page.wait_for_timeout(2_000)
 
         # Si un lecteur préféré est demandé, le sélectionner dans le dropdown
         if preferred_lecteur:
@@ -231,9 +289,9 @@ def extract_stream_url(page_url: str, preferred_lecteur: str | None = None) -> t
         urls = captured.get(name, [])
         if urls:
             print(f"  [franime] Lecteur choisi : {name} → {urls[0][:100]}")
-            return urls[0], name
+            return urls[0], name, captured, diagnostics
 
-    return None, None
+    return None, None, captured, diagnostics
 
 
 def _select_lecteur(page, lecteur_name: str):
@@ -260,31 +318,79 @@ def download_franime(url: str, output_path: str = "downloads",
                      download_type: str = "video", quality: str = "best") -> dict[str, Any]:
     os.makedirs(output_path, exist_ok=True)
 
-    # Essayer chaque lecteur dans l'ordre jusqu'à succès
-    lecteurs_a_essayer = [None] + LECTEUR_PRIORITY  # None = lecteur par défaut de la page
+    # 1. Première tentative : on laisse la page charger son lecteur par défaut
+    # et on récupère TOUT ce qui passe sur le réseau.
+    print(f"\n  [franime] Analyse de la page : {url}")
+    stream_url, nom, all_captured, diagnostics = extract_stream_url(url, preferred_lecteur=None)
 
-    last_error = None
-    for lecteur in lecteurs_a_essayer:
-        label = lecteur or "défaut"
-        print(f"\n  [franime] Tentative avec lecteur : {label}")
+    # On ne bloque que sur les erreurs fatales (401, 429) ou si vraiment rien n'est capturé
+    if diagnostics.get("blocked") and not stream_url:
+        status = diagnostics.get("main_status")
+        print(f"  [franime] ⚠ Page bloquée ({status}). Arrêt.")
+        return {
+            "success": False,
+            "filename": None,
+            "filepath": None,
+            "error": f"Page Franime bloquée ({status}).",
+            "reason": "page_blocked",
+        }
+
+    # On garde trace des URLs déjà testées pour ne pas boucler inutilement
+    tried_urls = set()
+
+    # Fonction interne pour tenter un téléchargement et gérer les erreurs
+    def try_download(s_url, s_name):
+        if not s_url or s_url in tried_urls:
+            return None
+        tried_urls.add(s_url)
+        print(f"  [franime] Tentative de téléchargement [{s_name}] : {s_url[:100]}...")
         try:
-            stream_url, nom = extract_stream_url(url, preferred_lecteur=lecteur)
-            if not stream_url:
-                print(f"  [franime] Aucun stream trouvé pour {label}, on essaie le suivant...")
-                continue
-
-            result = _download_stream(stream_url, nom or label, url, output_path, download_type, quality)
-            if result.get("filename"):
-                print(f"  [franime] ✓ Téléchargement réussi avec lecteur {nom or label}")
-                return result
-
+            res = _download_stream(s_url, s_name, url, output_path, download_type, quality)
+            if res.get("filename"):
+                return res
         except Exception as e:
-            last_error = e
-            print(f"  [franime] Lecteur {label} échoué : {e}")
-            continue
+            print(f"  [franime] Échec avec {s_name} ({s_url[:50]}) : {e}")
+        return None
 
-    # Au lieu de lever une erreur, on retourne un dictionnaire indiquant l'échec
-    # pour permettre à l'appelant de sauter l'épisode proprement.
+    # 2. On essaie d'abord le "meilleur" trouvé lors du premier passage (souvent HLS s'il est là)
+    if stream_url:
+        result = try_download(stream_url, nom)
+        if result: return result
+
+    # 3. On essaie toutes les autres URLs capturées lors du premier passage, par ordre de priorité
+    for name in LECTEUR_PRIORITY:
+        for s_url in all_captured.get(name, []):
+            result = try_download(s_url, name)
+            if result: return result
+
+    # 4. Si toujours rien, on force le changement de lecteur dans le navigateur pour les lecteurs restants
+    # (ceux qu'on n'a pas encore vus du tout lors du premier passage)
+    for lecteur in LECTEUR_PRIORITY:
+        # Si on a déjà capturé une URL pour ce lecteur, inutile de forcer (on l'a déjà testée au-dessus)
+        if all_captured.get(lecteur):
+            continue
+        
+        print(f"\n  [franime] Forçage du lecteur : {lecteur}")
+        try:
+            stream_url, nom, captured_now, diagnostics_now = extract_stream_url(url, preferred_lecteur=lecteur)
+            # On ne bloque pas sur 403 ici non plus
+            if diagnostics_now.get("blocked") and not stream_url and diagnostics_now.get("main_status") != 403:
+                status = diagnostics_now.get("main_status")
+                print(f"  [franime] ⚠ Bloqué ({status}).")
+                continue
+            # On tente l'URL principale retournée
+            if stream_url:
+                result = try_download(stream_url, nom)
+                if result: return result
+            
+            # On tente aussi les autres capturées pendant ce forçage
+            for name in LECTEUR_PRIORITY:
+                for s_url in captured_now.get(name, []):
+                    result = try_download(s_url, name)
+                    if result: return result
+        except Exception as e:
+            print(f"  [franime] Erreur lors du forçage {lecteur} : {e}")
+
     print(f"  [franime] ⚠ Aucun lecteur n'a fonctionné pour {url}")
     return {
         "success": False,
@@ -319,6 +425,7 @@ def _download_stream(stream_url: str, lecteur_name: str, page_url: str,
         "format": "bestvideo+bestaudio/best" if download_type != "audio" else "bestaudio/best",
         "outtmpl": os.path.join(output_path, f"{title}-{ep}.%(ext)s"),
         "quiet": False,
+        "no_warnings": True,
         "noplaylist": True,
         # ── Vitesse ──────────────────────────────────────────────────────────
         "concurrent_fragment_downloads": 16,   # 16 fragments en parallèle
@@ -327,6 +434,7 @@ def _download_stream(stream_url: str, lecteur_name: str, page_url: str,
         "file_access_retries": 5,
         "http_chunk_size": 10 * 1024 * 1024,   # chunks de 10 MB
         "socket_timeout": 30,
+        "hls_use_mpegts": True,                # Recommandé par yt-dlp pour HLS
         "http_headers": {
             "Referer":    referer,
             "Origin":     referer.rstrip("/"),

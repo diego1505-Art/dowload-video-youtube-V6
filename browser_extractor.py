@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from config import BROWSER_HEADLESS
+
 # ── Patterns de flux vidéo ───────────────────────────────────────────────────
 STREAM_PATTERNS = [
     re.compile(r"sibnet\.ru/shell\.php",     re.I),
@@ -193,12 +195,12 @@ def extract_streams(page_url: str, wait_seconds: int = 30) -> list[str]:
         if chrome and udata and os.path.isdir(os.path.join(udata, "Default")):
             tmp = _copy_chrome_profile_light(udata)
             ctx = pw.chromium.launch_persistent_context(
-                tmp, headless=False, executable_path=chrome,
+                tmp, headless=BROWSER_HEADLESS, executable_path=chrome,
                 args=args, no_viewport=True)
             page = ctx.new_page()
         else:
             browser = pw.chromium.launch(
-                headless=False, executable_path=chrome or None, args=args)
+                headless=BROWSER_HEADLESS, executable_path=chrome or None, args=args)
             ctx = browser.new_context(viewport={"width": 1280, "height": 720})
             page = ctx.new_page()
 

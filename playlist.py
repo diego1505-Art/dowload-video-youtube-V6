@@ -188,6 +188,30 @@ def download_media(url, output_path="downloads", download_type="video", quality=
     target_output_path = _build_output_folder(url, base_output_path)
     os.makedirs(target_output_path, exist_ok=True)
 
+    # ── Check existance ──────────────────────────────────────────────────────
+    # Si c'est du Franime, on peut prédire le nom de fichier
+    if _re.match(r"https?://(?:www\.)?franime\.fr/", url, _re.I):
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        slug = parsed.path.split('/')[-1] or "video"
+        s = params.get('s', ['1'])[0]
+        ep = params.get('ep', ['1'])[0]
+        lang = params.get('lang', ['vo'])[0]
+        filename_base = f"{slug}-s{s}-ep{ep}-{lang}"
+        
+        # On cherche si un fichier avec ce nom de base existe (peu importe l'extension)
+        for ext in VIDEO_EXTENSIONS | {".mp4", ".mkv", ".webm"}:
+            potential_file = os.path.join(target_output_path, f"{filename_base}{ext}")
+            if os.path.isfile(potential_file):
+                print(f"  [skip] Déjà téléchargé dans {target_output_path}: {os.path.basename(potential_file)}")
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "reason": "already_exists",
+                    "filename": os.path.basename(potential_file),
+                    "filepath": potential_file,
+                }
+
     # ── 1. Franime ───────────────────────────────────────────────────────────
     if _re.match(r"https?://(?:www\.)?franime\.fr/", url, _re.I):
         try:
@@ -225,6 +249,8 @@ def download_media(url, output_path="downloads", download_type="video", quality=
                 raise
 
     filepath = result.get("filepath")
+    if not filepath and result.get("reason") in {"not_found_or_blocked", "page_blocked"}:
+        result["skipped"] = True
     if filepath:
         result["relative_path"] = _relative_download_path(filepath, base_output_path)
         result["filename"] = os.path.basename(filepath)
